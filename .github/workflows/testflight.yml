@@ -61,6 +61,12 @@ jobs:
         working-directory: build_ios
         run: |
           sed -i '' "s/AAAAAAAAAA/$APPLE_TEAM_ID/g" RUNA.xcodeproj/project.pbxproj
+          # Files app: the game's folder (logs/godot.log, ai_test reports) shows under On My iPhone > RUNA only when
+          # BOTH keys are true. Godot's preset sets them separately; builds 10-13 had UIFileSharingEnabled false.
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            /usr/libexec/PlistBuddy -c "Set :$key true" RUNA/RUNA-Info.plist 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$key bool true" RUNA/RUNA-Info.plist
+            echo "$key = $(/usr/libexec/PlistBuddy -c "Print :$key" RUNA/RUNA-Info.plist)"
+          done
           # Apple rejects (ITMS-90208) a bundled framework built for a newer iOS than the app's minimum. The Terrain3D
           # library is built for iOS 18.5: raise the app's minimum (and each framework's Info.plist) to the highest one.
           MIN_IOS=15.0
