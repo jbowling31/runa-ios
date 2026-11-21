@@ -1,0 +1,84 @@
+name: Check build status in App Store Connect
+
+on:
+  workflow_dispatch:
+
+jobs:
+  status:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ask App Store Connect about recent builds
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          pip install -q pyjwt cryptography requests
+          python3 - <<'PY'
+          import os, re, time, textwrap, jwt, requests
+          raw = os.environ['ASC_KEY_P8'].replace('﻿', '').replace('\r', '')
+          body = re.sub(r'[^A-Za-z0-9+/=]', '', re.sub(r'-----(BEGIN|END)[A-Z ]*-----', '', raw))
+          key = '-----BEGIN PRIVATE KEY-----\n' + '\n'.join(textwrap.wrap(body, 64)) + '\n-----END PRIVATE KEY-----\n'
+          now = int(time.time())
+          tok = jwt.encode({'iss': os.environ['ASC_ISSUER_ID'], 'iat': now, 'exp': now + 600, 'aud': 'appstoreconnect-v1'},
+                           key, algorithm='ES256', headers={'kid': os.environ['ASC_KEY_ID'], 'typ': 'JWT'})
+          H = {'Authorization': 'Bearer ' + tok}
+          def get(path, **params):
+              r = requests.get('https://api.appstoreconnect.apple.com/v1/' + path, headers=H, params=params)
+              if r.status_code >= 400: print('HTTP', r.status_code, r.text[:500])
+              return r.json()
+          apps = get('apps', **{'filter[bundleId]': 'com.jbowling31.runa'})
+          for app in apps.get('data', []):
+              print('APP', app['id'], app['attributes']['name'], app['attributes']['bundleId'])
+              b = get('builds', **{'filter[app]': app['id'], 'sort': '-uploadedDate', 'limit': 10,
+                                   'include': 'buildBetaDetail'})
+              details = {d['id']: d['attributes'] for d in b.get('included', []) if d['type'] == 'buildBetaDetails'}
+              if not b.get('data'): print('  no builds yet')
+              for x in b.get('data', []):
+                  a = x['attributes']
+                  bd = details.get(x['relationships'].get('buildBetaDetail', {}).get('data', {}).get('id', ''), {})
+                  print('  BUILD', a.get('version'), '| processing:', a.get('processingState'), '| uploaded:', a.get('uploadedDate'),
+                        '| expired:', a.get('expired'), '| internal testing:', bd.get('internalBuildState'),
+                        '| encryption answered:', a.get('usesNonExemptEncryption'))
+              # newer API: each upload's own state, with Apple's errors if processing rejected it
+              import json
+              for path in ('apps/%s/buildUploads' % app['id'], 'buildUploads'):
+                  u = get(path, limit=10, **({'filter[app]': app['id']} if path == 'buildUploads' else {}))
+                  if u.get('data') is None: continue
+                  for x in u['data']:
+                      print('  UPLOAD', json.dumps(x.get('attributes', {}))[:1500])
+                  break
+              # TestFlight crash reports the tester chose to share, with their crash logs
+              cs = get('apps/%s/betaFeedbackCrashSubmissions' % app['id'], limit=5)
+              for c in cs.get('data', []):
+                  a = c['attributes']
+                  print('CRASH', c['id'], '|', a.get('createdDate'), '|', a.get('deviceModel'), '| iOS', a.get('osVersion'),
+                        '| build', a.get('buildBundleId', ''), '| comment:', a.get('comment'))
+                  log = get('betaFeedbackCrashSubmissions/%s/crashLog' % c['id'])
+                  text = (log.get('data') or {}).get('attributes', {}).get('logText', '')
+                  if text:
+                      os.makedirs('crashes', exist_ok=True)
+                      open('crashes/%s.crash' % c['id'], 'w').write(text)
+                      print('  saved crash log', len(text), 'chars')
+                      print('CRASHLOG-BEGIN'); print(text); print('CRASHLOG-END')
+              if not cs.get('data'): print('CRASH none shared yet')
+          if not apps.get('data'): print('No app found for com.jbowling31.runa')
+          testers = get('betaGroups', limit=20)
+          for g in testers.get('data', []):
+              print('GROUP', g['attributes']['name'], '| internal:', g['attributes'].get('isInternalGroup'), '| auto builds:', g['attributes'].get('hasAccessToAllBuilds'))
+              ts = get('betaGroups/%s/betaTesters' % g['id'], limit=50)
+              for x in ts.get('data', []):
+                  a = x['attributes']
+                  print('  TESTER | state:', a.get('state'), '| invite:', a.get('inviteType'))
+              if not ts.get('data'): print('  TESTER none in this group')
+              bs = get('betaGroups/%s/builds' % g['id'], limit=10)
+              print('  GROUP BUILDS', [x['attributes'].get('version') for x in bs.get('data', [])])
+          PY
+      - name: Keep crash logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-logs
+          path: crashes/
+          if-no-files-found: ignore
