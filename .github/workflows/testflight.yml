@@ -1,0 +1,212 @@
+name: Build and upload to TestFlight
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version shown in TestFlight (e.g. 0.1.0)"
+        required: false
+        default: "0.1.0"
+      big_memory:
+        description: "Ask iOS for the increased memory limit (the whole game needs it on most iPhones)"
+        type: boolean
+        default: true
+      signing:
+        description: "manual = sign with a one-run certificate (keeps the memory setting); cloud = Xcode cloud signing (drops it)"
+        type: choice
+        options: [manual, cloud]
+        default: manual
+
+jobs:
+  testflight:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      BUILD_NUMBER: ${{ github.run_number }}
+      APP_VERSION: ${{ github.event.inputs.version || '0.1.0' }}
+      SIGNING: ${{ github.event.inputs.signing || 'manual' }}
+      WANT_MEMORY: ${{ github.event.inputs.big_memory || 'true' }}
+      BUNDLE_ID: com.jbowling31.runa
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check secrets are set
+        run: |
+          missing=""
+          [ -n "$ASC_KEY_ID" ] || missing="$missing ASC_KEY_ID"
+          [ -n "$ASC_ISSUER_ID" ] || missing="$missing ASC_ISSUER_ID"
+          [ -n "$APPLE_TEAM_ID" ] || missing="$missing APPLE_TEAM_ID"
+          [ -n "${{ secrets.ASC_KEY_P8 }}" ] || missing="$missing ASC_KEY_P8"
+          if [ -n "$missing" ]; then echo "::error::Missing repo secrets:$missing"; exit 1; fi
+
+      - name: Pick newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | grep -v beta | sort -V | tail -1)
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Unpack the exported Godot project
+        run: |
+          cd parts
+          grep 'part0' ../parts.sha256 | shasum -a 256 -c -
+          cd ..
+          cat parts/runa_ios.tar.gz.part* | tar xz
+          rm -rf parts
+          ls -la build_ios
+
+      - name: Fill in team, version and export options
+        working-directory: build_ios
+        run: |
+          sed -i '' "s/AAAAAAAAAA/$APPLE_TEAM_ID/g" RUNA.xcodeproj/project.pbxproj
+          # Files app: the game's folder (logs/godot.log, ai_test reports) shows under On My iPhone > RUNA only when
+          # BOTH keys are true. Godot's preset sets them separately; builds 10-13 had UIFileSharingEnabled false.
+          for key in UIFileSharingEnabled LSSupportsOpeningDocumentsInPlace; do
+            /usr/libexec/PlistBuddy -c "Set :$key true" RUNA/RUNA-Info.plist 2>/dev/null || /usr/libexec/PlistBuddy -c "Add :$key bool true" RUNA/RUNA-Info.plist
+            echo "$key = $(/usr/libexec/PlistBuddy -c "Print :$key" RUNA/RUNA-Info.plist)"
+          done
+          # Apple rejects (ITMS-90208) a bundled framework built for a newer iOS than the app's minimum. The Terrain3D
+          # library is built for iOS 18.5: raise the app's minimum (and each framework's Info.plist) to the highest one.
+          MIN_IOS=15.0
+          for fw in $(find RUNA/dylibs -name "*.framework" -type d); do
+            bin="$fw/$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$fw/Info.plist")"
+            m=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+            echo "$(basename "$fw") needs iOS $m"
+            [ -n "$m" ] && [ "$(printf '%s\n%s\n' "$MIN_IOS" "$m" | sort -V | tail -1)" = "$m" ] && MIN_IOS=$m
+          done
+          for fw in $(find RUNA/dylibs -name "*.framework" -type d); do
+            /usr/libexec/PlistBuddy -c "Set :MinimumOSVersion $MIN_IOS" "$fw/Info.plist"
+            # The Terrain3D library names itself with a relative build path
+            # (project/addons/terrain_3d/bin/...dylib); iOS refuses to load that at launch ("relative path not allowed
+            # in hardened program"). Name each framework by its place inside the app instead.
+            exe=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$fw/Info.plist")
+            install_name_tool -id "@rpath/$(basename "$fw")/$exe" "$fw/$exe"
+            echo "$(basename "$fw") install name: $(otool -D "$fw/$exe" | tail -1)"
+          done
+          grep -A3 "LD_RUNPATH_SEARCH_PATHS" RUNA.xcodeproj/project.pbxproj | head -4
+          sed -i '' "s/IPHONEOS_DEPLOYMENT_TARGET = [0-9.]*;/IPHONEOS_DEPLOYMENT_TARGET = $MIN_IOS;/g" RUNA.xcodeproj/project.pbxproj
+          echo "MIN_IOS=$MIN_IOS" >> "$GITHUB_ENV"
+          echo "App minimum iOS: $MIN_IOS"
+
+      - name: Write App Store Connect key
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          printf '%s\n' "$ASC_KEY_P8" > "$RUNNER_TEMP/keys/raw.p8"
+          # Clean up what a copy from Windows Notepad can add: CR line endings, a byte-order mark, stray spaces,
+          # a key pasted without its BEGIN/END lines or squashed onto one line.
+          python3 - "$RUNNER_TEMP/keys/raw.p8" "$RUNNER_TEMP/keys/AuthKey.p8" <<'PY'
+          import sys, re, textwrap
+          t = open(sys.argv[1], encoding='utf-8', errors='ignore').read().replace('﻿', '').replace('\r', '')
+          body = re.sub(r'-----(BEGIN|END)[A-Z ]*-----', '', t)
+          body = re.sub(r'[^A-Za-z0-9+/=]', '', body)
+          print('key shape: had BEGIN line:', 'BEGIN' in t, '| had END line:', 'END' in t, '| base64 characters:', len(body))
+          out = '-----BEGIN PRIVATE KEY-----\n' + '\n'.join(textwrap.wrap(body, 64)) + '\n-----END PRIVATE KEY-----\n'
+          open(sys.argv[2], 'w').write(out)
+          PY
+          rm -f "$RUNNER_TEMP/keys/raw.p8"
+          openssl pkey -in "$RUNNER_TEMP/keys/AuthKey.p8" -noout && echo "key reads as a valid private key" || { echo "::error::The ASC_KEY_P8 secret is not a valid .p8 key. Re-paste the whole AuthKey file into it."; exit 1; }
+          echo "ASC_KEY_PATH=$RUNNER_TEMP/keys/AuthKey.p8" >> "$GITHUB_ENV"
+
+      - name: Signing identity for this run (manual)
+        if: env.SIGNING == 'manual'
+        run: |
+          pip3 install --quiet --break-system-packages pyjwt cryptography requests 2>/dev/null || pip3 install --quiet pyjwt cryptography requests
+          export WORK="$RUNNER_TEMP/keys" P12_PASS="$(uuidgen)"
+          echo "P12_PASS=$P12_PASS" >> "$GITHUB_ENV"
+          python3 tools/asc_sign.py setup
+          KC="$RUNNER_TEMP/runa-sign.keychain-db"
+          security create-keychain -p "$P12_PASS" "$KC"
+          security set-keychain-settings -lut 3600 "$KC"
+          security unlock-keychain -p "$P12_PASS" "$KC"
+          curl -fsSL -o "$RUNNER_TEMP/keys/wwdr.cer" https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer && \
+            security import "$RUNNER_TEMP/keys/wwdr.cer" -k "$KC" -T /usr/bin/codesign || true
+          security import "$RUNNER_TEMP/keys/dist.p12" -k "$KC" -P "$P12_PASS" -f pkcs12 -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$P12_PASS" "$KC" > /dev/null
+          security list-keychains -d user -s "$KC" $(security list-keychains -d user | tr -d '"')
+          security find-identity -v -p codesigning "$KC"
+          echo "SIGN_KEYCHAIN=$KC" >> "$GITHUB_ENV"
+
+      - name: Entitlements and export options
+        working-directory: build_ios
+        run: |
+          if [ "$WANT_MEMORY" = "true" ] && { [ "$SIGNING" = cloud ] || [ "${MEMORY_OK:-0}" = 1 ]; }; then
+            /usr/libexec/PlistBuddy -c "Add :com.apple.developer.kernel.increased-memory-limit bool true" RUNA/RUNA.entitlements
+            echo "Increased memory limit entitlement on"
+          elif [ "$WANT_MEMORY" = "true" ]; then
+            echo "::warning::Could not turn on Increased Memory Limit for the app ID; building without it"
+          fi
+          cat RUNA/RUNA.entitlements
+          if [ "$SIGNING" = manual ]; then
+            STYLE="<key>signingStyle</key><string>manual</string>
+            <key>signingCertificate</key><string>Apple Distribution</string>
+            <key>provisioningProfiles</key><dict><key>$BUNDLE_ID</key><string>$SIGN_PROFILE_NAME</string></dict>"
+          else
+            STYLE="<key>signingStyle</key><string>automatic</string>"
+          fi
+          cat > export_options.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            $STYLE
+            <key>uploadSymbols</key><false/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict>
+          </plist>
+          EOF
+          plutil -lint export_options.plist
+
+      - name: Archive
+        working-directory: build_ios
+        run: |
+          set -o pipefail
+          COMMON=(-project RUNA.xcodeproj -scheme RUNA -configuration Release -destination "generic/platform=iOS"
+            -archivePath "$RUNNER_TEMP/RUNA.xcarchive"
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CURRENT_PROJECT_VERSION="$BUILD_NUMBER" MARKETING_VERSION="$APP_VERSION" IPHONEOS_DEPLOYMENT_TARGET="$MIN_IOS")
+          if [ "$SIGNING" = manual ]; then
+            # signed for the App Store right here, entitlements included
+            xcodebuild archive "${COMMON[@]}" CODE_SIGN_STYLE=Manual CODE_SIGN_IDENTITY="Apple Distribution" \
+              PROVISIONING_PROFILE_SPECIFIER="$SIGN_PROFILE_NAME" PROVISIONING_PROFILE="" \
+              OTHER_CODE_SIGN_FLAGS="--keychain $SIGN_KEYCHAIN" | tail -n 150
+          else
+            # no development signing (needs a registered iPhone); cloud signing at export
+            xcodebuild archive "${COMMON[@]}" CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" | tail -n 150
+          fi
+          APP=$(ls -d "$RUNNER_TEMP/RUNA.xcarchive/Products/Applications/"*.app)
+          echo "Libraries the app loads at launch:"; otool -L "$APP/RUNA" | grep -v "/System/\|/usr/lib/" || true
+          otool -l "$APP/RUNA" | grep -A2 LC_RPATH | grep path || true
+          if otool -L "$APP/RUNA" | grep -v "@rpath\|/System/\|/usr/lib/\|:$" | grep -q .; then
+            echo "::error::The app links a library by a path iOS will refuse at launch"; exit 1; fi
+          echo "Entitlements in the app:"; codesign -d --entitlements - --xml "$APP" 2>/dev/null | plutil -p - 2>/dev/null || echo "(none)"
+
+      - name: Export and upload to TestFlight
+        working-directory: build_ios
+        run: |
+          set -o pipefail
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/RUNA.xcarchive" \
+            -exportOptionsPlist export_options.plist \
+            -exportPath "$RUNNER_TEMP/export" \
+            $( [ "$SIGNING" = cloud ] && echo -allowProvisioningUpdates ) \
+            -authenticationKeyPath "$ASC_KEY_PATH" \
+            -authenticationKeyID "$ASC_KEY_ID" \
+            -authenticationKeyIssuerID "$ASC_ISSUER_ID" \
+            | tail -n 200
+          echo "Uploaded build $BUILD_NUMBER (version $APP_VERSION). It shows in TestFlight after Apple finishes processing (usually 5-30 min)."
+
+      - name: Remove this run's certificate and profile
+        if: always() && env.SIGNING == 'manual'
+        run: |
+          WORK="$RUNNER_TEMP/keys" python3 tools/asc_sign.py cleanup || true
+          [ -n "${SIGN_KEYCHAIN:-}" ] && security delete-keychain "$SIGN_KEYCHAIN" || true
+
+      - name: Remove key
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/keys"
